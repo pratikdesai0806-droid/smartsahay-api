@@ -4,6 +4,7 @@ import com.smartsahay.model.EligibilityRequest;
 import com.smartsahay.model.EligibilityResult;
 import com.smartsahay.model.Scheme;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -13,15 +14,12 @@ import java.util.List;
  */
 public class IvrService {
 
-    /** Menu digit 1..6 -> scheme slug (all six exist in db/02_seed.sql). */
-    private static final String[] SCHEME_SLUGS = {
-            "pm-kisan-income-support-scheme",
-            "pradhan-mantri-fasal-bima-yojana",
-            "kisan-credit-card-scheme",
-            "soil-health-card-scheme",
-            "siri-dhanya-promotion",
-            "ganga-kalyana-scheme"
-    };
+    /** Menu groups, taken from the schemes.level column (ENUM Central/State), so they cannot drift from the database. */
+    public static final String[] GROUP_LEVELS = {"Central", "State"};
+    private static final String[] GROUP_LABELS = {"Central government schemes", "Karnataka state schemes"};
+
+    /** Schemes shown per page: keys 1..8. Key 9 = more, key 0 = back / repeat. */
+    public static final int PAGE_SIZE = 8;
 
     private static final String[] CATEGORIES = {"GENERAL", "SC", "ST", "OBC", "MINORITY"};
 
@@ -64,18 +62,90 @@ public class IvrService {
         }
     }
 
-    // ── Mode 1: scheme information ──────────────────────────────────────────
+    // ── Mode 1: scheme information (two-level, database-driven menu) ─────────
 
-    /** Returns the slug for "1".."6", or null if the digit is not on the menu. */
-    public String slugForDigit(String digits) {
-        if (digits == null || digits.length() != 1 || digits.charAt(0) < '1' || digits.charAt(0) > '6') {
-            return null;
-        }
-        return SCHEME_SLUGS[digits.charAt(0) - '1'];
+    public static class Option {
+        private final String key;
+        private final String label;
+        public Option(String key, String label) { this.key = key; this.label = label; }
+        public String getKey() { return key; }
+        public String getLabel() { return label; }
     }
 
-    public String invalidDigitSpeech() {
-        return "That key is not on the menu. Please press a number from 1 to 6.";
+    public static class Menu {
+        private String text;
+        private final List<Option> options;
+        private final String level;   // "main" or "list"
+        public Menu(String text, List<Option> options, String level) {
+            this.text = text;
+            this.options = options;
+            this.level = level;
+        }
+        public String getLevel() { return level; }
+        public String getText() { return text; }
+        public void setText(String text) { this.text = text; }
+        public List<Option> getOptions() { return options; }
+    }
+
+    /** Schemes of one group (1 = Central, 2 = State), in the order given (the DAO sorts by id). */
+    public List<Scheme> group(List<Scheme> all, int group) {
+        List<Scheme> out = new ArrayList<>();
+        if (group < 1 || group > GROUP_LEVELS.length) return out;
+        for (Scheme s : all) {
+            if (GROUP_LEVELS[group - 1].equalsIgnoreCase(s.getLevel())) out.add(s);
+        }
+        return out;
+    }
+
+    /** Top menu: one key per non-empty group. */
+    public Menu mainMenu(List<Scheme> all) {
+        List<Option> options = new ArrayList<>();
+        StringBuilder sb = new StringBuilder("Welcome to Smart Sahay. ");
+        for (int g = 1; g <= GROUP_LEVELS.length; g++) {
+            if (group(all, g).isEmpty()) continue;
+            options.add(new Option(String.valueOf(g), GROUP_LABELS[g - 1]));
+            sb.append("For ").append(GROUP_LABELS[g - 1]).append(" press ").append(g).append(". ");
+        }
+        if (options.isEmpty()) {
+            return new Menu("Sorry, no schemes are available right now. Please try again later.", options, "main");
+        }
+        sb.append("To hear this menu again press 0.");
+        return new Menu(toSpeech(sb.toString()), options, "main");
+    }
+
+    /** One page of a group's schemes, or null if the group is empty / the page does not exist. */
+    public Menu schemeMenu(List<Scheme> all, int group, int page) {
+        List<Scheme> list = group(all, group);
+        int from = page * PAGE_SIZE;
+        if (page < 0 || from >= list.size()) return null;
+        int to = Math.min(from + PAGE_SIZE, list.size());
+
+        List<Option> options = new ArrayList<>();
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < to; i++) {
+            String key = String.valueOf(i - from + 1);
+            options.add(new Option(key, list.get(i).getName()));
+            sb.append("For ").append(list.get(i).getName()).append(" press ").append(key).append(". ");
+        }
+        if (to < list.size()) {
+            options.add(new Option("9", "More schemes"));
+            sb.append("For more schemes press 9. ");
+        }
+        sb.append("To return to the main menu press 0.");
+        return new Menu(toSpeech(sb.toString()), options, "list");
+    }
+
+    /** The scheme behind key 1..8 on a page, or null if the group, page or key is not valid. */
+    public Scheme pick(List<Scheme> all, int group, int page, String digits) {
+        if (digits == null || digits.length() != 1 || digits.charAt(0) < '1' || digits.charAt(0) > '8') return null;
+        List<Scheme> list = group(all, group);
+        int index = page * PAGE_SIZE + (digits.charAt(0) - '1');
+        if (page < 0 || index >= list.size() || index >= (page + 1) * PAGE_SIZE) return null;
+        return list.get(index);
+    }
+
+    public String invalidKeySpeech() {
+        return "That key is not on the menu.";
     }
 
     public String schemeNotFoundSpeech() {
@@ -93,7 +163,8 @@ public class IvrService {
         if (s.getWhereToApply() != null && !s.getWhereToApply().isBlank()) {
             sb.append("You can apply at ").append(endWithPeriod(s.getWhereToApply()));
         }
-        return limit(toSpeech(sb.toString().trim()));
+        return limit(toSpeech(sb.toString().trim()))
+                + " Press another number for a different scheme in this list, or press 0 for the main menu.";
     }
 
     // ── Mode 2: eligibility ─────────────────────────────────────────────────

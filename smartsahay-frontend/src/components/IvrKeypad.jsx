@@ -10,22 +10,12 @@ import './IvrKeypad.css';
  *   askExtra   true  -> also ask FRUITS ID and Aadhaar-linked bank (8 questions)
  *              false -> only the 6 questions the backend's rules use
  *
+ * Scheme-information mode is a two-level menu that the backend builds from the database:
+ *   main menu (1 Central, 2 Karnataka state) -> schemes of that group, 8 per page (9 = more, 0 = back) -> summary.
+ * The page keeps no list of schemes itself, so it cannot disagree with the backend.
+ *
  * This is a demo mode. It is not a telephone service and needs no phone network.
  */
-
-const SCHEME_PROMPT =
-  'Welcome to Smart Sahay. For PM-KISAN income support press 1. For crop insurance press 2. ' +
-  'For Kisan Credit Card press 3. For Soil Health Card press 4. For millet promotion press 5. ' +
-  'For Ganga Kalyana scheme press 6.';
-
-const SCHEME_MENU = [
-  ['1', 'PM-KISAN Income Support'],
-  ['2', 'Crop Insurance (PMFBY)'],
-  ['3', 'Kisan Credit Card'],
-  ['4', 'Soil Health Card'],
-  ['5', 'Millet (Siri Dhanya) Promotion'],
-  ['6', 'Ganga Kalyana Scheme'],
-];
 
 const range = (min, max) => (d) => d !== '' && Number(d) >= min && Number(d) <= max;
 
@@ -77,24 +67,45 @@ export default function IvrKeypad({ apiBase = '', askExtra = false }) {
   const [buffer, setBuffer] = useState('');
   const [answers, setAnswers] = useState({});
   const [log, setLog] = useState([]);
+  // Scheme-information menu state (the lists themselves always come from the server)
+  const [group, setGroup] = useState(null);         // null = main menu, 1 = Central, 2 = Karnataka state
+  const [page, setPage] = useState(0);
+  const [options, setOptions] = useState([]);       // [{key, label}] for the menu on screen
+  const [menuText, setMenuText] = useState('');     // spoken text of the current menu, for repeating
 
   function say(text) {
     setLog((l) => [...l, text]);
     speak(text);
   }
 
-  async function callApi(path, options) {
+  // Returns { text, options } (options is null for plain answers). Never throws.
+  async function callApi(path, init) {
     setBusy(true);
     try {
-      const res = await fetch(`${apiBase}${path}`, options);
+      const res = await fetch(`${apiBase}${path}`, init);
       const data = await res.json().catch(() => null);
-      if (!res.ok) return 'Sorry, the service is not available right now. Please try again later.';
-      return data?.gather_prompt?.text || 'Sorry, something went wrong.';
+      if (!res.ok) return { text: 'Sorry, the service is not available right now. Please try again later.', options: null };
+      return { text: data?.gather_prompt?.text || 'Sorry, something went wrong.', options: data?.options || null, level: data?.level || null };
     } catch {
-      return 'Sorry, I could not reach the Smart Sahay server.';
+      return { text: 'Sorry, I could not reach the Smart Sahay server.', options: null };
     } finally {
       setBusy(false);
     }
+  }
+
+  // Load a menu from the server and make it the current one.
+  async function loadMenu(nextGroup, nextPage) {
+    const query = nextGroup == null ? '' : `?group=${nextGroup}&page=${nextPage}`;
+    const r = await callApi(`/api/ivr/menu${query}`);
+    if (r.options) {
+      // The server says which level it sent, so a fallback to the main menu is followed automatically.
+      const isMain = r.level !== 'list';
+      setGroup(isMain ? null : nextGroup);
+      setPage(isMain ? 0 : nextPage);
+      setOptions(r.options);
+      setMenuText(r.text);
+    }
+    say(r.text);
   }
 
   function startCall() {
@@ -103,8 +114,11 @@ export default function IvrKeypad({ apiBase = '', askExtra = false }) {
     setBuffer('');
     setAnswers({});
     setStep(0);
+    setGroup(null);
+    setPage(0);
+    setOptions([]);
     if (mode === 'scheme') {
-      say(SCHEME_PROMPT);
+      loadMenu(null, 0);
     } else {
       say('Welcome to Smart Sahay. I will ask a few questions to find schemes for you. ' + questions[0].prompt);
     }
@@ -117,12 +131,21 @@ export default function IvrKeypad({ apiBase = '', askExtra = false }) {
   }
 
   async function pressScheme(k) {
-    if (!/^[1-6]$/.test(k)) {
-      say('That key is not on the menu. ' + SCHEME_PROMPT);
-      return;
+    const offered = options.some((o) => o.key === k);
+
+    if (group == null) {                                   // main menu
+      if (k === '0') { say(menuText); return; }            // repeat
+      if (offered) { await loadMenu(Number(k), 0); return; }
+    } else {                                               // list of schemes
+      if (k === '0') { await loadMenu(null, 0); return; }  // back to main menu
+      if (k === '9' && offered) { await loadMenu(group, page + 1); return; }
+      if (offered) {
+        const r = await callApi(`/api/ivr/scheme?group=${group}&page=${page}&digits=${k}`);
+        say(r.text);
+        return;
+      }
     }
-    const text = await callApi(`/api/ivr/scheme?digits=${k}`);
-    say(text + ' Press another number to hear a different scheme, or end the call.');
+    say('That key is not on the menu. ' + menuText);
   }
 
   async function submit(value) {
@@ -141,12 +164,12 @@ export default function IvrKeypad({ apiBase = '', askExtra = false }) {
       return;
     }
     // Last answer: send everything in a POST body (never in the URL).
-    const text = await callApi('/api/ivr/eligibility', {
+    const r = await callApi('/api/ivr/eligibility', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(next),
     });
-    say(text + ' Thank you for calling Smart Sahay. Goodbye.');
+    say(r.text + ' Thank you for calling Smart Sahay. Goodbye.');
     setInCall(false);
   }
 
@@ -209,9 +232,10 @@ export default function IvrKeypad({ apiBase = '', askExtra = false }) {
           {busy && <p className="ivr-step">Please wait…</p>}
         </div>
 
-        {mode === 'scheme' && (
+        {mode === 'scheme' && inCall && options.length > 0 && (
           <ul className="ivr-menu">
-            {SCHEME_MENU.map(([k, label]) => <li key={k}><strong>{k}</strong> {label}</li>)}
+            {options.map((o) => <li key={o.key}><strong>{o.key}</strong> {o.label}</li>)}
+            <li><strong>0</strong> {group == null ? 'Repeat this menu' : 'Main menu'}</li>
           </ul>
         )}
 

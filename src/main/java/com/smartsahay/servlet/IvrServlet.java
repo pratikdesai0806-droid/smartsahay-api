@@ -23,10 +23,13 @@ import java.util.Map;
 /**
  * Simulated-IVR endpoints used by the keypad demo page.
  *
- *   GET  /api/ivr/scheme?digits=1     spoken summary of menu scheme 1..6
- *   POST /api/ivr/eligibility         JSON body of keypad answers -> spoken result
+ *   GET  /api/ivr/menu                              main menu (1 = Central, 2 = Karnataka state)
+ *   GET  /api/ivr/menu?group=1&page=0               schemes of a group, 8 per page (9 = more, 0 = back)
+ *   GET  /api/ivr/scheme?group=1&page=0&digits=3    spoken summary of one scheme
+ *   POST /api/ivr/eligibility                       JSON body of keypad answers -> spoken result
  *
- * Both return {"gather_prompt":{"text":"..."},"max_input_digits":1}.
+ * All return {"gather_prompt":{"text":"..."},"max_input_digits":1}; menus also return "level" ("main" or "list") and "options":[{key,label}].
+ * The menu is built from the schemes table on each request, so adding a scheme needs no code change.
  * Eligibility uses POST so a farmer's answers never appear in URLs or access logs.
  * Nothing about the farmer is stored or logged.
  */
@@ -40,21 +43,61 @@ public class IvrServlet extends HttpServlet {
 
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
-        if (!"/scheme".equals(req.getPathInfo())) {
+        String path = req.getPathInfo();
+        if (!"/menu".equals(path) && !"/scheme".equals(path)) {
             JsonUtil.error(resp, 404, "Not found");
             return;
         }
-        String slug = ivr.slugForDigit(req.getParameter("digits"));
-        if (slug == null) {
-            speak(resp, ivr.invalidDigitSpeech());
+        try {
+            // The menu is built from the database on every call, so keys always match the real schemes.
+            List<Scheme> all = schemeDao.findAll(null, null, null);
+            if ("/menu".equals(path)) {
+                menu(req, resp, all);
+            } else {
+                scheme(req, resp, all);
+            }
+        } catch (SQLException e) {
+            getServletContext().log("IVR menu lookup failed", e);
+            JsonUtil.error(resp, 500, "Internal server error");
+        }
+    }
+
+    /** GET /api/ivr/menu              -> main menu (Central / State)
+     *  GET /api/ivr/menu?group=1&page=0 -> one page of that group's schemes */
+    private void menu(HttpServletRequest req, HttpServletResponse resp, List<Scheme> all) throws IOException {
+        if (req.getParameter("group") == null) {
+            speak(resp, ivr.mainMenu(all));
             return;
         }
+        IvrService.Menu sub = ivr.schemeMenu(all, intParam(req, "group", -1), intParam(req, "page", 0));
+        if (sub == null) {
+            IvrService.Menu main = ivr.mainMenu(all);
+            main.setText("Sorry, that option is not available. " + main.getText());
+            speak(resp, main);
+            return;
+        }
+        speak(resp, sub);
+    }
+
+    /** GET /api/ivr/scheme?group=1&page=0&digits=3 -> spoken summary of the 3rd scheme on that page */
+    private void scheme(HttpServletRequest req, HttpServletResponse resp, List<Scheme> all)
+            throws IOException, SQLException {
+        Scheme picked = ivr.pick(all, intParam(req, "group", -1), intParam(req, "page", 0), req.getParameter("digits"));
+        if (picked == null) {
+            speak(resp, ivr.invalidKeySpeech());
+            return;
+        }
+        Scheme detail = schemeDao.findBySlug(picked.getSlug());   // loads benefits
+        speak(resp, detail == null ? ivr.schemeNotFoundSpeech() : ivr.schemeSpeech(detail));
+    }
+
+    private static int intParam(HttpServletRequest req, String name, int fallback) {
+        String v = req.getParameter(name);
+        if (v == null) return fallback;
         try {
-            Scheme scheme = schemeDao.findBySlug(slug);
-            speak(resp, scheme == null ? ivr.schemeNotFoundSpeech() : ivr.schemeSpeech(scheme));
-        } catch (SQLException e) {
-            getServletContext().log("IVR scheme lookup failed", e);
-            JsonUtil.error(resp, 500, "Internal server error");
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 
@@ -91,5 +134,13 @@ public class IvrServlet extends HttpServlet {
         JsonUtil.send(resp, 200, Map.of(
                 "gather_prompt", Map.of("text", text),
                 "max_input_digits", 1));
+    }
+
+    private void speak(HttpServletResponse resp, IvrService.Menu menu) throws IOException {
+        JsonUtil.send(resp, 200, Map.of(
+                "gather_prompt", Map.of("text", menu.getText()),
+                "max_input_digits", 1,
+                "level", menu.getLevel(),
+                "options", menu.getOptions()));
     }
 }
